@@ -40,6 +40,74 @@
       localStorage.setItem(API_KEY_STORAGE, key);
     }
 
+    // ---------- Tool definition for structured output ----------
+    // Forcing the model to call this tool guarantees a valid JSON shape,
+    // which removes the brittle JSON.parse(text) path and lets us drop the
+    // "Respond ONLY with valid JSON" instructions from the system prompt.
+    const SUBMIT_QUESTIONS_TOOL = {
+      name: "submit_questions",
+      description: "Submit 5 to 6 sharp, open-ended coaching questions the user should consider about their meeting.",
+      input_schema: {
+        type: "object",
+        properties: {
+          questions: {
+            type: "array",
+            minItems: 5,
+            maxItems: 6,
+            items: {
+              type: "object",
+              properties: {
+                question: { type: "string", description: "The coaching question, phrased as an open-ended prompt." },
+                context: { type: "string", description: "A brief rationale — why this question matters for this specific meeting." }
+              },
+              required: ["question", "context"]
+            }
+          }
+        },
+        required: ["questions"]
+      }
+    };
+
+    // Extract fully-formed {question, context} objects from a partial JSON
+    // payload produced by a streaming tool_use block. Best-effort: balances
+    // braces while respecting string escapes, so we can render questions as
+    // they complete instead of waiting for the final message_stop event.
+    function extractCompletedQuestions(partialJson) {
+      const results = [];
+      const idx = partialJson.indexOf("[");
+      if (idx === -1) return results;
+      const arr = partialJson.slice(idx + 1);
+
+      let depth = 0;
+      let start = -1;
+      let inString = false;
+      let escape = false;
+
+      for (let i = 0; i < arr.length; i++) {
+        const c = arr[i];
+        if (escape) { escape = false; continue; }
+        if (c === "\\") { escape = true; continue; }
+        if (c === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === "{") {
+          if (depth === 0) start = i;
+          depth++;
+        } else if (c === "}") {
+          depth--;
+          if (depth === 0 && start !== -1) {
+            try {
+              const obj = JSON.parse(arr.slice(start, i + 1));
+              if (obj && typeof obj.question === "string" && typeof obj.context === "string") {
+                results.push(obj);
+              }
+            } catch {}
+            start = -1;
+          }
+        }
+      }
+      return results;
+    }
+
     // ---------- Settings Panel ----------
     function SettingsPanel({ apiKey, setApiKey, onClose }) {
       const [draft, setDraft] = useState(apiKey);
@@ -136,7 +204,7 @@
         setLoading(true);
         setQuestions([]);
 
-        const systemPrompt = "You are a seasoned agile delivery coach and consultant. Your job is to read a meeting agenda or meeting minutes and generate 5 to 6 sharp, open-ended coaching questions the user should consider asking or reflecting on. Focus on uncovering hidden risks, assumptions, blockers, or misalignments. Avoid generic questions. Make them specific to the content provided.\n\nRespond ONLY with valid JSON — no markdown, no code fences, no extra text. Use this exact format:\n[{\"question\":\"...\",\"context\":\"...\"}]";
+        const systemPromptText = "You are a seasoned agile delivery coach and consultant. Your job is to read a meeting agenda or meeting minutes and generate 5 to 6 sharp, open-ended coaching questions the user should consider asking or reflecting on. Focus on uncovering hidden risks, assumptions, blockers, or misalignments. Avoid generic questions. Make them specific to the content provided. Always call the submit_questions tool to return your questions.";
 
         const userMsg = `${role ? `My role: ${role}\n\n` : ""}Here is the meeting content:\n\n${input}`;
 
@@ -150,10 +218,19 @@
               "anthropic-dangerous-direct-browser-access": "true"
             },
             body: JSON.stringify({
-              model: "claude-sonnet-4-20250514",
+              model: "claude-sonnet-4-6",
               max_tokens: 1500,
-              system: systemPrompt,
-              messages: [{ role: "user", content: userMsg }]
+              // Structured `system` block so we can attach cache_control.
+              // Anthropic will only actually cache once the cached prefix
+              // exceeds the minimum token threshold; for short prompts this
+              // is a no-op today but future-proofs the call.
+              system: [
+                { type: "text", text: systemPromptText, cache_control: { type: "ephemeral" } }
+              ],
+              tools: [SUBMIT_QUESTIONS_TOOL],
+              tool_choice: { type: "tool", name: "submit_questions" },
+              messages: [{ role: "user", content: userMsg }],
+              stream: true
             })
           });
 
@@ -162,13 +239,58 @@
             throw new Error(body.error?.message || `API error ${res.status}`);
           }
 
-          const data = await res.json();
-          const text = data.content?.[0]?.text || "";
-          const parsed = JSON.parse(text);
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let partialJson = "";
+          let streamed = [];
+          let finalQuestions = null;
 
-          setQuestions(parsed);
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
 
-          const session = { timestamp: Date.now(), input, role, questions: parsed };
+            // SSE events are separated by a blank line.
+            let sep;
+            while ((sep = buffer.indexOf("\n\n")) !== -1) {
+              const rawEvent = buffer.slice(0, sep);
+              buffer = buffer.slice(sep + 2);
+
+              let dataLine = "";
+              for (const line of rawEvent.split("\n")) {
+                if (line.startsWith("data: ")) dataLine += line.slice(6);
+              }
+              if (!dataLine) continue;
+
+              let evt;
+              try { evt = JSON.parse(dataLine); } catch { continue; }
+
+              if (evt.type === "content_block_delta" && evt.delta?.type === "input_json_delta") {
+                partialJson += evt.delta.partial_json || "";
+                const completed = extractCompletedQuestions(partialJson);
+                if (completed.length > streamed.length) {
+                  streamed = completed;
+                  setQuestions([...completed]);
+                }
+              } else if (evt.type === "message_stop") {
+                try {
+                  const obj = JSON.parse(partialJson);
+                  if (Array.isArray(obj?.questions)) finalQuestions = obj.questions;
+                } catch {
+                  // Fall back to whatever the progressive parser captured.
+                }
+              } else if (evt.type === "error") {
+                throw new Error(evt.error?.message || "Stream error");
+              }
+            }
+          }
+
+          const resolved = finalQuestions || streamed;
+          if (!resolved.length) throw new Error("No questions were returned. Please try again.");
+          setQuestions(resolved);
+
+          const session = { timestamp: Date.now(), input, role, questions: resolved };
           const updated = [session, ...sessions].slice(0, 5);
           setSessions(updated);
           saveSessions(updated);
