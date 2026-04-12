@@ -33,11 +33,15 @@
     }
 
     function loadApiKey() {
-      return localStorage.getItem(API_KEY_STORAGE) || "";
+      // Trim on load so any previously-saved key with stray whitespace
+      // (very common when pasting from email / password managers into a
+      // type="password" input where you can't see the trailing newline)
+      // gets cleaned up automatically.
+      return (localStorage.getItem(API_KEY_STORAGE) || "").trim();
     }
 
     function saveApiKey(key) {
-      localStorage.setItem(API_KEY_STORAGE, key);
+      localStorage.setItem(API_KEY_STORAGE, key.trim());
     }
 
     // ---------- Tool definition for structured output ----------
@@ -111,6 +115,18 @@
     // ---------- Settings Panel ----------
     function SettingsPanel({ apiKey, setApiKey, onClose }) {
       const [draft, setDraft] = useState(apiKey);
+      const trimmed = draft.trim();
+      const fingerprint = trimmed
+        ? `${trimmed.length} chars, starts with “${trimmed.slice(0, 7)}…”`
+        : "";
+      const hasWhitespace = draft !== trimmed;
+
+      function save() {
+        setApiKey(trimmed);
+        saveApiKey(trimmed);
+        onClose();
+      }
+
       return (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 rounded-2xl p-6 w-full max-w-md shadow-xl border border-slate-700">
@@ -121,13 +137,19 @@
               value={draft}
               onChange={e => setDraft(e.target.value)}
               placeholder="sk-ant-..."
-              className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-4"
+              className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-2"
             />
-            <p className="text-xs text-slate-400 mb-6">Your key is stored only in this browser's localStorage. It is sent directly to the Anthropic API and nowhere else.</p>
+            {fingerprint && (
+              <p className="text-xs text-slate-500 mb-2">Will save: {fingerprint}</p>
+            )}
+            {hasWhitespace && (
+              <p className="text-xs text-amber-400 mb-2">Leading/trailing whitespace detected — it will be trimmed on save.</p>
+            )}
+            <p className="text-xs text-slate-400 mb-6 mt-2">Your key is stored only in this browser's localStorage. It is sent directly to the Anthropic API and nowhere else.</p>
             <div className="flex gap-3 justify-end">
               <button onClick={onClose} className="px-4 py-2 rounded-lg text-slate-300 hover:bg-slate-700 transition">Cancel</button>
               <button
-                onClick={() => { setApiKey(draft); saveApiKey(draft); onClose(); }}
+                onClick={save}
                 className="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 transition font-medium"
               >Save</button>
             </div>
@@ -236,7 +258,11 @@
 
           if (!res.ok) {
             const body = await res.json().catch(() => ({}));
-            throw new Error(body.error?.message || `API error ${res.status}`);
+            const rawMsg = body.error?.message || `API error ${res.status}`;
+            const hint = res.status === 401
+              ? " — open Settings and re-paste your key (watch for trailing whitespace or a missing character)."
+              : "";
+            throw new Error(rawMsg + hint);
           }
 
           const reader = res.body.getReader();
